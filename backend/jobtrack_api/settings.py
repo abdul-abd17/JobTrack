@@ -1,11 +1,13 @@
 """
 Django settings for JobTrack API project.
 Built for production-readiness, security, and scalability.
+Compatible with Render (backend), Vercel (frontend), and Managed MySQL.
 """
 
 from pathlib import Path
 from datetime import timedelta
 import os
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -14,16 +16,46 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Load environment variables from .env file
 load_dotenv(BASE_DIR / '.env')
 
-# Quick-start development settings - unsuitable for production
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-fallback-development-key')
+# -----------------------------------------------------------------------------
+# CORE APPLICATION SETTINGS & SECRETS
+# -----------------------------------------------------------------------------
 
 DEBUG = os.getenv('DEBUG', 'True').strip().lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
+if DEBUG:
+    SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-fallback-development-key')
+else:
+    raw_secret = os.getenv('SECRET_KEY', '').strip()
+    if not raw_secret or raw_secret == 'django-insecure-fallback-development-key' or len(raw_secret) < 32:
+        raise ImproperlyConfigured(
+            "In production (DEBUG=False), a strong, cryptographically secure SECRET_KEY "
+            "environment variable (minimum 32 characters) is strictly required. "
+            "Never use the development fallback key in production."
+        )
+    SECRET_KEY = raw_secret
+
+# -----------------------------------------------------------------------------
+# HOSTS & NETWORKING CONFIGURATION
+# -----------------------------------------------------------------------------
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    if host.strip()
+]
+
+# Auto-detect Render external hostname if running in Render's container runtime
+render_hostname = os.getenv('RENDER_EXTERNAL_HOSTNAME', '').strip()
+if render_hostname and render_hostname not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(render_hostname)
+
 if DEBUG and 'testserver' not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append('testserver')
 
-# Application definition
+# -----------------------------------------------------------------------------
+# APPLICATION DEFINITION
+# -----------------------------------------------------------------------------
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -46,6 +78,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -74,11 +107,22 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'jobtrack_api.wsgi.application'
 
-# Database Configuration
-# Primary: MySQL via PyMySQL. Fallback: SQLite for development resilience.
+# -----------------------------------------------------------------------------
+# DATABASE CONFIGURATION
+# -----------------------------------------------------------------------------
+# Development: SQLite fallback is permitted when DEBUG=True for local agility.
+# Production: Managed MySQL with explicit SSL/TLS is strictly enforced.
+# Silent fallback to SQLite in production is explicitly prohibited.
+
 use_sqlite = os.getenv('USE_SQLITE_FALLBACK', 'False').strip().lower() in ('true', '1', 'yes')
 
-if use_sqlite:
+if not DEBUG and use_sqlite:
+    raise ImproperlyConfigured(
+        "USE_SQLITE_FALLBACK=True is strictly prohibited when DEBUG=False. "
+        "Production deployments on ephemeral platforms (like Render) require a persistent managed MySQL database."
+    )
+
+if DEBUG and use_sqlite:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
@@ -86,51 +130,112 @@ if use_sqlite:
         }
     }
 else:
+    db_name = os.getenv('DB_NAME', '').strip()
+    db_user = os.getenv('DB_USER', '').strip()
+    db_password = os.getenv('DB_PASSWORD', '')
+    db_host = os.getenv('DB_HOST', '').strip()
+    db_port = os.getenv('DB_PORT', '3306').strip()
+
+    if not DEBUG:
+        missing_vars = []
+        if not db_name:
+            missing_vars.append('DB_NAME')
+        if not db_user:
+            missing_vars.append('DB_USER')
+        if not db_host:
+            missing_vars.append('DB_HOST')
+        if missing_vars:
+            raise ImproperlyConfigured(
+                f"Production MySQL configuration is incomplete. Missing environment variable(s): {', '.join(missing_vars)}. "
+                "Managed MySQL requires DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, and DB_PORT."
+            )
+
+    mysql_options = {
+        'charset': 'utf8mb4',
+        'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+    }
+
+    # PyMySQL SSL/TLS Configuration:
+    # PyMySQL expects an 'ssl' key under database OPTIONS (either a dict or an SSLContext).
+    # DB_SSL_REQUIRED: 'True' enforces encrypted TLS connection to cloud MySQL.
+    # DB_SSL_CA: Optional path to custom CA certificate bundle (e.g. /etc/ssl/certs/ca-certificates.crt).
+    # DB_SSL_CHECK_HOSTNAME: 'True' or 'False' (default True).
+    ssl_required = os.getenv('DB_SSL_REQUIRED', 'False').strip().lower() in ('true', '1', 'yes')
+    ssl_ca = os.getenv('DB_SSL_CA', '').strip()
+    ssl_check_hostname = os.getenv('DB_SSL_CHECK_HOSTNAME', 'True').strip().lower() in ('true', '1', 'yes')
+
+    if ssl_required or ssl_ca:
+        if ssl_ca:
+            if not os.path.exists(ssl_ca):
+                raise ImproperlyConfigured(
+                    f"DB_SSL_CA file not found at '{ssl_ca}'. Ensure the CA certificate bundle exists on disk."
+                )
+            mysql_options['ssl'] = {
+                'ca': ssl_ca,
+                'check_hostname': ssl_check_hostname,
+                'verify_mode': 'required',
+            }
+        else:
+            # Managed cloud provider utilizing system CA bundle (e.g. OS trust store / certifi)
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = ssl_check_hostname
+            mysql_options['ssl'] = ctx
+
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.mysql',
-            'NAME': os.getenv('DB_NAME', 'jobtrack_db'),
-            'USER': os.getenv('DB_USER', 'root'),
-            'PASSWORD': os.getenv('DB_PASSWORD', ''),
-            'HOST': os.getenv('DB_HOST', '127.0.0.1'),
-            'PORT': os.getenv('DB_PORT', '3306'),
-            'OPTIONS': {
-                'charset': 'utf8mb4',
-                'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-            },
+            'NAME': db_name or 'jobtrack_db',
+            'USER': db_user or 'root',
+            'PASSWORD': db_password or '',
+            'HOST': db_host or '127.0.0.1',
+            'PORT': db_port or '3306',
+            'OPTIONS': mysql_options,
         }
     }
 
-# Password validation
+# -----------------------------------------------------------------------------
+# PASSWORD VALIDATION
+# -----------------------------------------------------------------------------
+
 AUTH_PASSWORD_VALIDATORS = [
-    {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-        'OPTIONS': {'min_length': 8},
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-    },
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator', 'OPTIONS': {'min_length': 8}},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
-# Internationalization
+# -----------------------------------------------------------------------------
+# INTERNATIONALIZATION & TIMEZONE
+# -----------------------------------------------------------------------------
+
 LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-# Static files (CSS, JavaScript, Images)
-STATIC_URL = 'static/'
+# -----------------------------------------------------------------------------
+# STATIC FILES (WhiteNoise Configuration)
+# -----------------------------------------------------------------------------
+
+STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Django REST Framework Configuration
+# -----------------------------------------------------------------------------
+# DJANGO REST FRAMEWORK CONFIGURATION
+# -----------------------------------------------------------------------------
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -143,7 +248,10 @@ REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }
 
-# SimpleJWT Settings with Rotation and Token Blacklist
+# -----------------------------------------------------------------------------
+# JWT (SimpleJWT) CONFIGURATION
+# -----------------------------------------------------------------------------
+
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
@@ -158,16 +266,74 @@ SIMPLE_JWT = {
     'USER_ID_CLAIM': 'user_id',
 }
 
-# CORS Configuration
+# -----------------------------------------------------------------------------
+# CORS & CSRF CONFIGURATION
+# -----------------------------------------------------------------------------
+
 CORS_ALLOW_ALL_ORIGINS = DEBUG
-CORS_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(',')
-    if origin.strip()
-]
 CORS_ALLOW_CREDENTIALS = True
 
-# Logging Configuration
+cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '')
+if cors_origins_raw:
+    CORS_ALLOWED_ORIGINS = [
+        origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()
+    ]
+elif DEBUG:
+    CORS_ALLOWED_ORIGINS = [
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+    ]
+else:
+    CORS_ALLOWED_ORIGINS = []
+
+# CSRF Trusted Origins (required for POST/form requests across origins in Django 4+)
+csrf_origins_raw = os.getenv('CSRF_TRUSTED_ORIGINS', '')
+if csrf_origins_raw:
+    CSRF_TRUSTED_ORIGINS = [
+        origin.strip() for origin in csrf_origins_raw.split(',') if origin.strip()
+    ]
+else:
+    # Auto-derive from CORS origins and Render host
+    CSRF_TRUSTED_ORIGINS = [
+        origin for origin in CORS_ALLOWED_ORIGINS if origin.startswith('http://') or origin.startswith('https://')
+    ]
+    if render_hostname:
+        CSRF_TRUSTED_ORIGINS.append(f'https://{render_hostname}')
+    if not CSRF_TRUSTED_ORIGINS and DEBUG:
+        CSRF_TRUSTED_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173']
+
+# -----------------------------------------------------------------------------
+# PRODUCTION HTTPS & REVERSE PROXY SECURITY (Render)
+# -----------------------------------------------------------------------------
+
+# Render terminates TLS at edge reverse proxy and forwards with X-Forwarded-Proto header
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+if not DEBUG:
+    # Enforce SSL redirect unless explicitly disabled in env (e.g. local container debugging)
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True').strip().lower() in ('true', '1', 'yes')
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+
+    # HSTS (HTTP Strict Transport Security)
+    # Default to 1 year; can be overridden or set to 0 during initial domain verification
+    hsts_seconds = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_SECONDS = hsts_seconds
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = hsts_seconds > 0
+    SECURE_HSTS_PRELOAD = hsts_seconds > 0
+else:
+    SECURE_SSL_REDIRECT = False
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+    SECURE_HSTS_SECONDS = 0
+
+# -----------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# -----------------------------------------------------------------------------
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

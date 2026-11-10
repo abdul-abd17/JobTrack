@@ -422,62 +422,101 @@ By default, `USE_SQLITE_FALLBACK=True` allows immediate local development using 
 
 ## 13. Testing & Quality Assurance
 
-JobTrack includes an automated test suite covering authentication, CRUD operations, input validation, status activity timeline generation, and multi-tenant data isolation.
+JobTrack includes an automated test suite covering authentication, CRUD operations, input validation, status activity timeline generation, multi-tenant data isolation, and production security guards.
 
 ### Running Backend Tests
 ```bash
 python backend/manage.py test accounts applications -v 2
 ```
-**Test Results (32 Tests Passed):**
-```
-Ran 32 tests in 22.900s
+**Test Results (37 Tests Passed):**
+```text
+Ran 37 tests in 26.071s
+
 OK
 Destroying test database for alias 'default'...
+Found 37 test(s).
 System check identified no issues (0 silenced).
 ```
+**Coverage Summary:**
+- **Accounts & JWT Authentication (10 tests)**: Registration, password validation, duplicate user prevention, JWT access/refresh token generation, refresh rotation, token blacklisting on logout, profile retrieval, profile updates, and authenticated password changes.
+- **Job Applications & Timeline Activities (22 tests)**: CRUD operations, company/title validation, salary format acceptance, atomic status transition logging, timeline activity generation, statistics endpoint aggregation, pagination, status tab filtering, and multi-tenant cross-user access isolation.
+- **Production Environment Safety Guards (5 tests)**: Rejection of missing/insecure `SECRET_KEY` when `DEBUG=False`, strict prohibition of SQLite fallback in production, verification of complete MySQL environment variables, SSL CA certificate path validation, and automatic `RENDER_EXTERNAL_HOSTNAME` detection.
+
+> [!NOTE]
+> **Database Test Verification:** Automated tests and local development are executed against Django's SQLite database (`backend/db.sqlite3`). PyMySQL and production MySQL settings are pre-configured, but live connectivity to managed cloud MySQL must be validated once the remote database instance is provisioned.
 
 ### Running Frontend Production Build
 ```bash
 npm run build --prefix frontend
 ```
 **Build Output:**
-```
+```text
 ✓ 2280 modules transformed.
-dist/index.html                   1.16 kB
-dist/assets/index-V2u9nDaQ.css   38.50 kB
-dist/assets/icons-C0G8NinQ.js    15.28 kB
-dist/assets/index-B5T_M9FS.js    85.43 kB
-dist/assets/vendor-IRhq7YeK.js  223.41 kB
-dist/assets/charts-Bd4bt5FE.js  412.93 kB
-✓ built in 3.01s
+dist/index.html                   1.16 kB │ gzip:   0.58 kB
+dist/assets/index-V2u9nDaQ.css   38.50 kB │ gzip:   6.79 kB
+dist/assets/icons-C0G8NinQ.js    15.28 kB │ gzip:   3.46 kB
+dist/assets/index-B8tjxaBI.js    85.51 kB │ gzip:  22.71 kB
+dist/assets/vendor-IRhq7YeK.js  223.41 kB │ gzip:  75.25 kB
+dist/assets/charts-Bd4bt5FE.js  412.93 kB │ gzip: 111.63 kB
+✓ built in 4.23s
 ```
 
 ---
 
-## 14. Deployment Architecture
+## 14. Production Deployment Architecture & Guide
 
-JobTrack is designed for production deployment on platforms such as Render, Railway, AWS, or DigitalOcean:
+JobTrack is architected for decoupled cloud deployment:
 
-```
-[Users / Browsers] 
-       │
-       ▼
-[Cloudflare / CDN] (SSL Termination & Static Asset Caching)
-       │
-       ├───> [Frontend Host (Vercel / Netlify / S3)] ──> Serves compiled Vite SPA
-       │
-       └───> [Backend API (Gunicorn / Uvicorn on Docker)]
-                   │
-                   ├──> [SimpleJWT Token Blacklist & Auth Engine]
-                   └──> [Managed MySQL Database (AWS RDS / PlanetScale)]
+```mermaid
+flowchart LR
+    Browser["User Browser"] -->|HTTPS| Vercel["Vercel CDN (Frontend SPA)"]
+    Browser -->|API Requests (JWT)| Render["Render Web Service (Django + Gunicorn)"]
+    Render -->|WhiteNoise| Static["Static Assets (Admin & DRF)"]
+    Render -->|PyMySQL with TLS/SSL| MySQL[("Managed Cloud MySQL")]
 ```
 
-### Production Checklist
-1. Set `DEBUG=False` in `backend/.env`.
-2. Configure strong `SECRET_KEY`.
-3. Set `ALLOWED_HOSTS` to your production domain (e.g., `api.jobtrack.dev`).
-4. Set `CORS_ALLOWED_ORIGINS` to your frontend domain (e.g., `https://jobtrack.dev`).
-5. Run `python manage.py collectstatic` to gather static files.
+### A. Backend Deployment on Render
+
+1. **Create Web Service:** Connect your GitHub repository `https://github.com/abdul-abd17/JobTrack`.
+2. **Build & Start Settings:**
+   - **Root Directory:** `backend`
+   - **Environment:** Python 3
+   - **Build Command:** `./build.sh` (installs dependencies via `pip` and gathers assets via `collectstatic`)
+   - **Start Command:** `gunicorn jobtrack_api.wsgi:application --bind 0.0.0.0:$PORT`
+3. **Database Migrations:**
+   > [!IMPORTANT]
+   > Database migrations are **intentionally decoupled** from `build.sh` to prevent uncontrolled schema mutation during build/packaging phases.
+   > Run migrations manually via the **Render Shell** after deployment starts:
+   > ```bash
+   > python manage.py migrate
+   > ```
+4. **Environment Variables on Render:**
+   - `DEBUG`: `False`
+   - `SECRET_KEY`: *(Generate a secure random string of at least 50 characters)*
+   - `ALLOWED_HOSTS`: `localhost,127.0.0.1` *(Render automatically appends `RENDER_EXTERNAL_HOSTNAME`)*
+   - `CORS_ALLOWED_ORIGINS`: `https://<your-app>.vercel.app`
+   - `CSRF_TRUSTED_ORIGINS`: `https://<your-app>.vercel.app`
+   - `USE_SQLITE_FALLBACK`: `False` *(Enforces managed MySQL; SQLite in production is strictly blocked)*
+   - `DB_NAME`: `<your_db_name>`
+   - `DB_USER`: `<your_db_user>`
+   - `DB_PASSWORD`: `<your_db_password>`
+   - `DB_HOST`: `<your_db_host>`
+   - `DB_PORT`: `3306`
+   - `DB_SSL_REQUIRED`: `True` *(Enforces TLS/SSL connection with managed MySQL)*
+   - `PYTHON_VERSION`: `3.11.9`
+
+### B. Frontend Deployment on Vercel
+
+1. **Import Project:** Select your GitHub repository `JobTrack`.
+2. **Build & Output Settings:**
+   - **Framework Preset:** Vite
+   - **Root Directory:** `frontend`
+   - **Build Command:** `npm run build`
+   - **Output Directory:** `dist`
+3. **Environment Variables on Vercel:**
+   - `VITE_API_BASE_URL`: `https://<your-render-service>.onrender.com/api`
+4. **Client-Side SPA Routing:**
+   `frontend/vercel.json` contains the necessary rewrite rule (`"source": "/(.*)", "destination": "/index.html"`) ensuring direct browser refreshes on `/dashboard`, `/applications`, and `/profile` resolve cleanly without 404 errors.
 
 ---
 
@@ -501,18 +540,11 @@ JobTrack is designed for production deployment on platforms such as Render, Rail
 
 ---
 
-## 16. Live Application URL
-- **Live Demo**: `[Coming Soon / Deployment Pending]`
-
----
-
-## 17. GitHub Repository
-- **Repository URL**: `https://github.com/abdul-abd17/JobTrack`
-
----
-
-## 18. Demo Video
-- **Walkthrough Video**: `[Coming Soon / Link Pending]`
+## 16. Deployment Status & Live Links
+- **Deployment Status**: Production Preparation Complete (Awaiting Cloud Provider Provisioning)
+- **Frontend URL**: `[Pending Vercel Deployment]`
+- **Backend API URL**: `[Pending Render Deployment]`
+- **GitHub Repository**: [https://github.com/abdul-abd17/JobTrack](https://github.com/abdul-abd17/JobTrack)
 
 ---
 

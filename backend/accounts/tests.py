@@ -4,6 +4,10 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
+import subprocess
+import sys
+import os
+from pathlib import Path
 
 
 class UserAuthenticationTests(TestCase):
@@ -146,4 +150,101 @@ class UserAuthenticationTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password('BrandNewPassword456!'))
+
+
+class ProductionSettingsSecurityTests(TestCase):
+    """
+    Automated verification of production environment safety guards:
+    - Rejection of missing or insecure SECRET_KEY in production (DEBUG=False).
+    - Prohibition of SQLite fallback in production.
+    - Enforcement of complete MySQL credentials when DEBUG=False.
+    - Automatic inclusion of Render external hostname in ALLOWED_HOSTS.
+    - Enforcement of existing DB_SSL_CA file path if specified.
+    """
+
+    def setUp(self):
+        self.backend_dir = Path(__file__).resolve().parent.parent
+        self.manage_py = str(self.backend_dir / 'manage.py')
+
+    def run_check(self, env_overrides):
+        """Helper to run 'manage.py check' with isolated environment variables."""
+        env = os.environ.copy()
+        env.update(env_overrides)
+        return subprocess.run(
+            [sys.executable, self.manage_py, 'check'],
+            cwd=str(self.backend_dir),
+            env=env,
+            capture_output=True,
+            text=True
+        )
+
+    def test_production_missing_secret_key_fails(self):
+        """Test that missing or insecure SECRET_KEY in production raises ImproperlyConfigured."""
+        result = self.run_check({
+            'DEBUG': 'False',
+            'SECRET_KEY': 'django-insecure-fallback-development-key',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('ImproperlyConfigured', result.stderr)
+        self.assertIn('SECRET_KEY', result.stderr)
+
+    def test_production_sqlite_fallback_prohibited(self):
+        """Test that USE_SQLITE_FALLBACK=True is strictly rejected when DEBUG=False."""
+        result = self.run_check({
+            'DEBUG': 'False',
+            'SECRET_KEY': 'a' * 50,
+            'USE_SQLITE_FALLBACK': 'True',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('USE_SQLITE_FALLBACK=True is strictly prohibited when DEBUG=False', result.stderr)
+
+    def test_production_missing_db_credentials_fails(self):
+        """Test that missing DB_NAME or DB_HOST raises ImproperlyConfigured when DEBUG=False."""
+        result = self.run_check({
+            'DEBUG': 'False',
+            'SECRET_KEY': 'a' * 50,
+            'USE_SQLITE_FALLBACK': 'False',
+            'DB_NAME': '',
+            'DB_USER': '',
+            'DB_HOST': '',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Production MySQL configuration is incomplete', result.stderr)
+
+    def test_production_invalid_ssl_ca_path_fails(self):
+        """Test that pointing DB_SSL_CA to a nonexistent path raises ImproperlyConfigured."""
+        result = self.run_check({
+            'DEBUG': 'False',
+            'SECRET_KEY': 'a' * 50,
+            'USE_SQLITE_FALLBACK': 'False',
+            'DB_NAME': 'test_db',
+            'DB_USER': 'test_user',
+            'DB_PASSWORD': 'test_password',
+            'DB_HOST': '127.0.0.1',
+            'DB_SSL_CA': 'non_existent_certificate_ca.pem',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('DB_SSL_CA file not found', result.stderr)
+
+    def test_render_external_hostname_auto_added(self):
+        """Test that RENDER_EXTERNAL_HOSTNAME is automatically detected and added to ALLOWED_HOSTS."""
+        script = (
+            "import os, django; "
+            "os.environ['RENDER_EXTERNAL_HOSTNAME'] = 'jobtrack-api.onrender.com'; "
+            "django.setup(); "
+            "from django.conf import settings; "
+            "assert 'jobtrack-api.onrender.com' in settings.ALLOWED_HOSTS"
+        )
+        env = os.environ.copy()
+        env['USE_SQLITE_FALLBACK'] = 'True'
+        env['DEBUG'] = 'True'
+        env['RENDER_EXTERNAL_HOSTNAME'] = 'jobtrack-api.onrender.com'
+        proc = subprocess.run(
+            [sys.executable, '-c', script],
+            cwd=str(self.backend_dir),
+            env=env,
+            capture_output=True,
+            text=True
+        )
+        self.assertEqual(proc.returncode, 0, f"Script failed with stderr: {proc.stderr}")
 
