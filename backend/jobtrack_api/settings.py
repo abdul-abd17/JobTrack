@@ -135,6 +135,16 @@ else:
     db_password = os.getenv('DB_PASSWORD', '')
     db_host = os.getenv('DB_HOST', '').strip()
     db_port = os.getenv('DB_PORT', '3306').strip()
+    raw_engine = os.getenv('DB_ENGINE', '').strip()
+
+    # Determine Database Engine:
+    # Dedicated TiDB custom backend for TiDB Cloud Starter, standard MySQL for traditional instances.
+    if raw_engine and raw_engine not in ('django.db.backends.mysql', 'jobtrack_api.db.backends.tidb'):
+        db_engine = raw_engine
+    elif db_port == '4000' or 'tidb' in db_host.lower() or raw_engine == 'jobtrack_api.db.backends.tidb':
+        db_engine = 'jobtrack_api.db.backends.tidb'
+    else:
+        db_engine = 'django.db.backends.mysql'
 
     if not DEBUG:
         missing_vars = []
@@ -142,6 +152,8 @@ else:
             missing_vars.append('DB_NAME')
         if not db_user:
             missing_vars.append('DB_USER')
+        if not db_password or not db_password.strip():
+            missing_vars.append('DB_PASSWORD')
         if not db_host:
             missing_vars.append('DB_HOST')
         if missing_vars:
@@ -156,41 +168,71 @@ else:
     }
 
     # PyMySQL SSL/TLS Configuration:
-    # PyMySQL expects an 'ssl' key under database OPTIONS (either a dict or an SSLContext).
-    # DB_SSL_REQUIRED: 'True' enforces encrypted TLS connection to cloud MySQL.
-    # DB_SSL_CA: Optional path to custom CA certificate bundle (e.g. /etc/ssl/certs/ca-certificates.crt).
-    # DB_SSL_CHECK_HOSTNAME: 'True' or 'False' (default True).
-    ssl_required = os.getenv('DB_SSL_REQUIRED', 'False').strip().lower() in ('true', '1', 'yes')
-    ssl_ca = os.getenv('DB_SSL_CA', '').strip()
-    ssl_check_hostname = os.getenv('DB_SSL_CHECK_HOSTNAME', 'True').strip().lower() in ('true', '1', 'yes')
+    # In production (DEBUG=False), TLS encryption, hostname validation, and CA bundle are strictly mandatory.
+    ssl_required_raw = os.getenv('DB_SSL_REQUIRED', 'True' if not DEBUG else 'False')
+    ssl_required = ssl_required_raw.strip().lower() in ('true', '1', 'yes')
 
-    if ssl_required or ssl_ca:
-        if ssl_ca:
-            if not os.path.exists(ssl_ca):
-                raise ImproperlyConfigured(
-                    f"DB_SSL_CA file not found at '{ssl_ca}'. Ensure the CA certificate bundle exists on disk."
-                )
-            mysql_options['ssl'] = {
-                'ca': ssl_ca,
-                'check_hostname': ssl_check_hostname,
-                'verify_mode': 'required',
-            }
-        else:
-            # Managed cloud provider utilizing system CA bundle (e.g. OS trust store / certifi)
-            import ssl
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = ssl_check_hostname
-            mysql_options['ssl'] = ctx
+    if not DEBUG and not ssl_required:
+        raise ImproperlyConfigured(
+            "DB_SSL_REQUIRED=True is strictly required when DEBUG=False. "
+            "Production MySQL/TiDB database connections must be encrypted."
+        )
+
+    ssl_check_hostname_raw = os.getenv('DB_SSL_CHECK_HOSTNAME', 'True')
+    ssl_check_hostname = ssl_check_hostname_raw.strip().lower() in ('true', '1', 'yes')
+
+    if not DEBUG and not ssl_check_hostname:
+        raise ImproperlyConfigured(
+            "DB_SSL_CHECK_HOSTNAME=True is strictly required when DEBUG=False. "
+            "Hostname verification cannot be disabled in production."
+        )
+
+    ssl_ca = os.getenv('DB_SSL_CA', '').strip()
+
+    if not DEBUG and not ssl_ca:
+        raise ImproperlyConfigured(
+            "DB_SSL_CA is strictly required when DEBUG=False. "
+            "Configure the path to the CA certificate bundle (e.g. /etc/secrets/tidb-ca.pem)."
+        )
+
+    if ssl_ca:
+        if not os.path.exists(ssl_ca):
+            raise ImproperlyConfigured(
+                f"DB_SSL_CA file not found at '{ssl_ca}'. Ensure the CA certificate bundle exists on disk."
+            )
+        mysql_options['ssl'] = {
+            'ca': ssl_ca,
+            'check_hostname': ssl_check_hostname,
+            'verify_mode': 'required',
+        }
+    elif ssl_required:
+        # Development mode utilizing system CA bundle when DB_SSL_REQUIRED=True
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = ssl_check_hostname
+        mysql_options['ssl'] = ctx
+
+    conn_max_age_raw = os.getenv('DB_CONN_MAX_AGE', '60').strip()
+    try:
+        conn_max_age = int(conn_max_age_raw)
+        if conn_max_age < 0:
+            raise ValueError("Negative value not allowed")
+    except (ValueError, TypeError):
+        raise ImproperlyConfigured(
+            f"DB_CONN_MAX_AGE must be a non-negative integer, got '{conn_max_age_raw}'."
+        )
 
     DATABASES = {
         'default': {
-            'ENGINE': 'django.db.backends.mysql',
-            'NAME': db_name or 'jobtrack_db',
+            'ENGINE': db_engine,
+            'NAME': db_name or 'jobtrack',
             'USER': db_user or 'root',
             'PASSWORD': db_password or '',
             'HOST': db_host or '127.0.0.1',
             'PORT': db_port or '3306',
             'OPTIONS': mysql_options,
+            'CONN_MAX_AGE': conn_max_age,
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 
